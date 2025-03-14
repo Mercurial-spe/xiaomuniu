@@ -341,22 +341,106 @@ def create_simple_corrected_file(base_file_data: Dict[int, Dict[str, Any]],
     
     return output_file, correction_logs
 
+def create_hidden_file(base_file_data: Dict[int, Dict[str, Any]], 
+                      all_responses: List[Dict[int, Dict[str, Any]]],
+                      output_dir: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    隐藏某些已知正确的response值，将其改为-1，并记录隐藏的日志。
+    当所有文件中该response对应的logprob都大于-0.001时，隐藏该response。
+    
+    Args:
+        base_file_data: 基准文件的数据
+        all_responses: 所有文件的响应数据列表
+        output_dir: 输出目录
+        
+    Returns:
+        输出文件路径和隐藏日志列表
+    """
+    hidden_logs = []
+    hidden_data = {}
+    
+    # 遍历基准文件中的每个条目
+    for idx, item in base_file_data.items():
+        # 检查所有文件中该索引的response对应的logprob是否都大于-0.001
+        all_logprobs_greater = True
+        for file_data in all_responses:
+            if idx in file_data:
+                response_data = file_data[idx]
+                response = response_data.get('response', '')
+                if not response:
+                    all_logprobs_greater = False
+                    break
+                    
+                # 获取该response对应的logprob
+                if 'logprobs' in response_data and 'content' in response_data['logprobs']:
+                    logprobs = response_data['logprobs']['content']
+                    if 'top_logprobs' in logprobs:
+                        # 查找当前response对应的logprob
+                        response_logprob = None
+                        for prob in logprobs['top_logprobs']:
+                            if str(prob['index']) == response:
+                                response_logprob = prob['logprob']
+                                break
+                        
+                        if response_logprob is None or response_logprob <= -0.001:
+                            all_logprobs_greater = False
+                            break
+                    else:
+                        all_logprobs_greater = False
+                        break
+                else:
+                    all_logprobs_greater = False
+                    break
+            else:
+                all_logprobs_greater = False
+                break
+        
+        # 如果所有logprob都大于-0.001，则隐藏该response
+        if all_logprobs_greater and len(hidden_logs) < 265:  # 最多隐藏前265条
+            original_response = item.get('response', '')
+            hidden_data[idx] = {'response': '-1'}
+            hidden_logs.append({
+                'index': idx,
+                'original': original_response,
+                'hidden': '-1',
+                'reason': '所有response对应的logprob大于-0.001'
+            })
+        else:
+            hidden_data[idx] = {'response': item.get('response', '')}
+    
+    # 保存隐藏后的文件
+    output_file = os.path.join(output_dir, 'hidden_responses.jsonl')
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for idx in sorted(hidden_data.keys()):
+            f.write(json.dumps(hidden_data[idx], ensure_ascii=False) + '\n')
+    
+    return output_file, hidden_logs
+
 def main():
     parser = argparse.ArgumentParser(description='比较多个JSON文件中的响应并创建修正文件')
     parser.add_argument('files', nargs='+', help='要比较的JSON文件路径')
     
-    # 创建互斥参数组，使--simple和--weighted不能同时使用
+    # 创建互斥参数组，使--simple、--weighted和--hide不能同时使用
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument('--simple', action='store_true', help='使用简单模式进行比较，仅基于response值')
     mode_group.add_argument('--weighted', action='store_true', default=True, help='(默认) 使用logprob加权模式进行比较')
+    mode_group.add_argument('--hide', action='store_true', default=False, help='隐藏某些已知正确的response值，将其改为-1')
     
     parser.add_argument('--weights', type=float, nargs='+', 
                        help='每个文件的权重，按顺序指定。例如：--weights 2.0 0.9 1.0')
     args = parser.parse_args()
     
     file_paths = args.files
+    
+    # 如果提供了权重参数，自动使用加权模式
+    if args.weights:
+        args.weighted = True
+        args.hide = False
+        args.simple = False
+    
     # 根据参数确定模式
-    mode = 'simple' if args.simple else 'weighted'
+    mode = 'simple' if args.simple else 'hide' if args.hide else 'weighted'
     file_weights = args.weights
     
     # 检查文件数量
@@ -430,6 +514,8 @@ def main():
     print("\n正在创建修正后的文件...")
     if mode == 'weighted':
         corrected_file, correction_logs = create_corrected_file(all_responses[0], all_responses, output_dir, file_weights)
+    elif mode == 'hide':
+        corrected_file, hidden_logs = create_hidden_file(all_responses[0], all_responses, output_dir)
     else:
         # 简单模式：只根据多数决策创建修正文件
         corrected_file, correction_logs = create_simple_corrected_file(all_responses[0], all_responses, output_dir)
@@ -449,6 +535,8 @@ def main():
             for i, (file_path, weight) in enumerate(zip(file_paths, file_weights)):
                 f.write(f"文件 {i+1} ({os.path.basename(file_path)}): 权重 = {weight}\n")
             f.write("\n")
+        elif mode == 'hide':
+            f.write("隐藏模式：隐藏某些已知正确的response值\n\n")
         else:
             f.write("简单模式：基于多数投票，不使用权重\n\n")
             
@@ -456,19 +544,31 @@ def main():
         f.write(summary_text)
         
         # 添加修正日志
-        if correction_logs:
+        if mode == 'weighted' and correction_logs:
             f.write("\n\n修正日志:\n")
             f.write(f"总共修正了 {len(correction_logs)} 条记录\n")
             for log in correction_logs:
-                if mode == 'weighted':
-                    f.write(f"索引 {log['index']}: 原值 '{log['original']}' -> 修正值 '{log['corrected']}' (最佳分数: {log['best_score']})\n")
-                    f.write(f"计算过程: {log['calculation_details']}\n")
-                else:
-                    f.write(f"索引 {log['index']}: 原值 '{log['original']}' -> 修正值 '{log['corrected']}' (投票: {log['vote_count']}/{log['total_votes']})\n")
+                f.write(f"索引 {log['index']}: 原值 '{log['original']}' -> 修正值 '{log['corrected']}' (最佳分数: {log['best_score']})\n")
+                f.write(f"计算过程: {log['calculation_details']}\n")
+        elif mode == 'hide' and hidden_logs:
+            f.write("\n\n隐藏日志:\n")
+            f.write(f"总共隐藏了 {len(hidden_logs)} 条记录\n")
+            for log in hidden_logs:
+                f.write(f"索引 {log['index']}: 原值 '{log['original']}' -> 隐藏值 '{log['hidden']}' (原因: {log['reason']})\n")
+        elif mode == 'simple' and correction_logs:
+            f.write("\n\n修正日志:\n")
+            f.write(f"总共修正了 {len(correction_logs)} 条记录\n")
+            for log in correction_logs:
+                f.write(f"索引 {log['index']}: 原值 '{log['original']}' -> 修正值 '{log['corrected']}' (投票: {log['vote_count']}/{log['total_votes']})\n")
     
     print(f"摘要已保存到 {summary_file}")
     print(f"修正后的文件已保存到 {corrected_file}")
-    print(f"总共修正了 {len(correction_logs)} 条记录")
+    if mode == 'weighted':
+        print(f"总共修正了 {len(correction_logs)} 条记录")
+    elif mode == 'hide':
+        print(f"总共隐藏了 {len(hidden_logs)} 条记录")
+    else:
+        print(f"总共修正了 {len(correction_logs)} 条记录")
     print(f"\n所有输出文件已保存到目录: {output_dir}")
 
 if __name__ == "__main__":
